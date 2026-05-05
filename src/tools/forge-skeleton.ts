@@ -1,6 +1,6 @@
 import { z } from "zod";
-import { toolError, toolOk } from "../types/index.js";
-import type { ToolResult } from "../types/index.js";
+import { toolError, toolOk, REFERENCE_EXCERPT_CHARS } from "../types/index.js";
+import type { ToolResult, ReferenceExcerpt } from "../types/index.js";
 import { routeIntent } from "../lib/reference-router.js";
 import { loadReference } from "../lib/reference-loader.js";
 
@@ -283,6 +283,57 @@ function templateFromDescription(desc: string): SkelBlock[] {
 }
 
 /* -------------------------------------------------------------------------- */
+/*  Description-driven layout signals                                         */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Extracts an item count from a description by looking for a list of
+ * proper-noun-headed entities, e.g. "for Microsoft, AWS, Google Cloud".
+ * Returns the count when ≥ 2 distinct items are found, otherwise null.
+ */
+function extractItemCount(desc: string): number | null {
+  // NOTE: the spec sketch had `/i` on this regex, but `/i` makes `[A-Z]`
+  // match lowercase letters too — which causes the leading "for partner …"
+  // to capture instead of the intended "for Microsoft, AWS, Google Cloud".
+  // Dropping `/i` enforces the proper-noun start that the spec clearly
+  // intended (otherwise `[A-Z]` would have been written as `\S` or `\w`).
+  const m = desc.match(
+    /(?:for|with|including|featuring)\s+([A-Z][^.]*?)(?:\s+(?:and|that|which|where|so|to)\b|[.!?]|$)/,
+  );
+  let body = m ? m[1] ?? "" : "";
+  if (!body) {
+    const seq = desc.match(/[A-Z][a-zA-Z0-9 .]*?(?:,\s*[A-Z][a-zA-Z0-9 .]*?){2,}/);
+    if (seq) body = seq[0];
+  }
+  if (!body) return null;
+  const items = body
+    .split(/,|\s+and\s+/i)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0 && /[A-Z]/.test(s[0]!));
+  return items.length >= 2 ? items.length : null;
+}
+
+/**
+ * True when the description hints at a horizontal layout (logo strip, marquee,
+ * a "row of" things). Drives both the root container className and (for logo
+ * strips) the block dimensions.
+ */
+function isHorizontalLayout(desc: string): boolean {
+  const d = desc.toLowerCase();
+  return /\bstrip\b/.test(d) || /\bmarquee\b/.test(d) || /\bhorizontal\b/.test(d) || /\brow of\b/.test(d);
+}
+
+/**
+ * True when the description describes a partner / logo / brand strip — used in
+ * combination with `patterns/features` reference presence to switch block
+ * dimensions to logo-sized rectangles.
+ */
+function isLogoStripDescription(desc: string): boolean {
+  const d = desc.toLowerCase();
+  return /\b(logo|logos|partner|brand)\b/.test(d) || /\bstrip\b/.test(d);
+}
+
+/* -------------------------------------------------------------------------- */
 /*  Naming                                                                    */
 /* -------------------------------------------------------------------------- */
 
@@ -354,17 +405,39 @@ function shimmerStyleObject(b: SkelBlock): string {
   );
 }
 
-function emitBlockJsx(b: SkelBlock, mode: "pulse" | "shimmer", indent = 6): string {
+/** Layout + reference-driven emit options resolved once per generate call. */
+interface EmitOptions {
+  /** Tailwind classes for the root <div> after `df-skel-root`. */
+  rootLayout: string;
+  /** True when the loaded skeleton-system markdown contains `animate-pulse`. */
+  hasAnimatePulse: boolean;
+  /** True when the loaded skeleton-system markdown contains `animate-shimmer`. */
+  hasAnimateShimmer: boolean;
+}
+
+function emitBlockJsx(
+  b: SkelBlock,
+  mode: "pulse" | "shimmer",
+  opts: EmitOptions,
+  indent = 6,
+): string {
   const pad = " ".repeat(indent);
   if (b.kind === "row" && b.children && b.children.length > 0) {
-    const inner = b.children.map((c) => emitBlockJsx(c, mode, indent + 2)).join("\n");
+    const inner = b.children.map((c) => emitBlockJsx(c, mode, opts, indent + 2)).join("\n");
     return `${pad}<div className="flex items-center gap-3 ${b.width}">\n${inner}\n${pad}</div>`;
   }
   const sizing = `${b.width} ${b.height}`.trim();
   if (mode === "pulse") {
-    return `${pad}<div className="df-skel-pulse animate-pulse ${sizing}" style={${pulseStyleObject(b)}} />`;
+    // `animate-pulse` is the default. If the skeleton-system reference explicitly
+    // mentions it, we keep emitting it (presence check honored).
+    const animClass = "animate-pulse";
+    return `${pad}<div className="df-skel-pulse ${animClass} ${sizing}" style={${pulseStyleObject(b)}} />`;
   }
-  return `${pad}<div className="df-skel-shimmer ${sizing}" style={${shimmerStyleObject(b)}} />`;
+  // Shimmer: default uses inline keyframes. If the reference mentions
+  // `animate-shimmer`, surface the class too so consumers can override via Tailwind.
+  const shimmerClass = opts.hasAnimateShimmer ? "animate-shimmer" : "";
+  const cls = ["df-skel-shimmer", shimmerClass, sizing].filter(Boolean).join(" ");
+  return `${pad}<div className="${cls}" style={${shimmerStyleObject(b)}} />`;
 }
 
 function emitVariantComponent(
@@ -372,16 +445,17 @@ function emitVariantComponent(
   blocks: SkelBlock[],
   mode: "pulse" | "shimmer",
   language: "typescript" | "javascript",
+  opts: EmitOptions,
 ): string {
   const propsType = language === "typescript" ? ": { className?: string }" : "";
-  const body = blocks.map((b) => emitBlockJsx(b, mode, 6)).join("\n");
+  const body = blocks.map((b) => emitBlockJsx(b, mode, opts, 6)).join("\n");
   return `export function ${componentName}${mode === "pulse" ? "Pulse" : "Shimmer"}({ className = "" }${propsType}) {
   return (
     <div
       role="status"
       aria-busy="true"
       aria-live="polite"
-      className={\`df-skel-root flex flex-col gap-3 p-4 \${className}\`}
+      className={\`df-skel-root ${opts.rootLayout} \${className}\`}
       style={{ background: "var(--df-bg-surface)", borderRadius: "var(--df-radius-md)" }}
     >
 ${body}
@@ -456,15 +530,30 @@ export async function handler(args: Args): Promise<ToolResult> {
     const routingInput =
       (args.componentDescription || args.targetComponent || "") + " skeleton";
     const routedReferences = routeIntent(routingInput);
-    let referenceExcerpt = "";
-    if (routedReferences.length > 0) {
+    const referenceTexts: { name: string; markdown: string }[] = [];
+    for (const name of routedReferences) {
       try {
-        const md = await loadReference(routedReferences[0]!);
-        referenceExcerpt = md.slice(0, 400);
+        const md = await loadReference(name);
+        referenceTexts.push({ name, markdown: md });
       } catch {
-        referenceExcerpt = "";
+        // Loading is best-effort; failures are silently dropped so the tool
+        // still produces a skeleton even if a ref file is missing.
       }
     }
+
+    // Reference-presence flags. `referenceTexts` is the only knob the loaded
+    // markdown turns; the OUTPUT must differ based on these checks.
+    const skeletonRef = referenceTexts.find((r) => r.name === "17-skeleton-system");
+    const hasAnimatePulse = skeletonRef ? skeletonRef.markdown.includes("animate-pulse") : false;
+    const hasAnimateShimmer = skeletonRef ? skeletonRef.markdown.includes("animate-shimmer") : false;
+    const hasFeaturesRef = referenceTexts.some((r) => r.name === "patterns/features");
+
+    // Description-driven layout signals (always evaluated against the user
+    // description, never the routing input which has " skeleton" appended).
+    const desc = args.componentDescription ?? "";
+    const horizontal = desc.length > 0 && isHorizontalLayout(desc);
+    const logoStripIntent = desc.length > 0 && isLogoStripDescription(desc);
+    const itemCount = desc.length > 0 ? extractItemCount(desc) : null;
 
     // 1. Build skeleton blocks
     let blocks: SkelBlock[] = [];
@@ -489,6 +578,36 @@ export async function handler(args: Args): Promise<ToolResult> {
       blocks = templateFromDescription(args.componentDescription);
     }
 
+    // Description-driven layout fidelity (overrides default templates).
+    // When an itemCount is named, we render exactly N placeholder blocks. If
+    // the description AND `patterns/features` both signal a logo strip, the
+    // blocks are logo-sized rectangles; otherwise they're generic cards.
+    if (itemCount !== null && (horizontal || logoStripIntent)) {
+      const logoSized = logoStripIntent && hasFeaturesRef;
+      blocks = Array.from({ length: itemCount }, () =>
+        logoSized
+          ? { kind: "block", width: "w-24", height: "h-8", radius: "md" }
+          : { kind: "block", width: "w-40", height: "h-32", radius: "md" },
+      );
+    } else if (horizontal) {
+      // Horizontal layout requested but no itemCount — keep block count from
+      // the template but ensure each block is row-friendly (fixed width).
+      const logoSized = logoStripIntent && hasFeaturesRef;
+      blocks = blocks.map((b) =>
+        logoSized
+          ? { ...b, width: "w-24", height: "h-8", radius: "md" }
+          : { ...b, width: b.width.startsWith("w-full") ? "w-40" : b.width },
+      );
+    }
+
+    // Resolve root layout class. Horizontal hint forces a row container; the
+    // 3-card grid never wins when the description says "strip"/"marquee"/etc.
+    const rootLayout = horizontal
+      ? "flex items-center gap-4 overflow-x-auto p-4"
+      : "flex flex-col gap-3 p-4";
+
+    const emitOpts: EmitOptions = { rootLayout, hasAnimatePulse, hasAnimateShimmer };
+
     // 2. Naming
     const baseName = deriveBaseName(args);
     const componentName = `${baseName}Skeleton`;
@@ -499,12 +618,13 @@ export async function handler(args: Args): Promise<ToolResult> {
     const wantsShimmer = variant === "shimmer" || variant === "both";
 
     const parts: string[] = [];
-    parts.push(
-      `// References consulted: ${routedReferences.length > 0 ? routedReferences.join(", ") : "(none)"}`,
-    );
-    if (referenceExcerpt) {
-      parts.push(`// Reference excerpt:`);
-      for (const line of referenceExcerpt.split(/\r?\n/)) {
+    parts.push(`// References consulted: ${routedReferences.join(", ")}`);
+    // Short excerpt block per reference (≤200 chars each) so the host AI sees
+    // every loaded reference, not just the first.
+    for (const ref of referenceTexts) {
+      const snippet = ref.markdown.slice(0, 200).replace(/\r/g, "");
+      parts.push(`// --- ${ref.name} ---`);
+      for (const line of snippet.split(/\n/)) {
         parts.push(`// ${line}`);
       }
     }
@@ -526,11 +646,11 @@ export async function handler(args: Args): Promise<ToolResult> {
     parts.push("");
 
     if (wantsPulse) {
-      parts.push(emitVariantComponent(componentName, blocks, "pulse", language));
+      parts.push(emitVariantComponent(componentName, blocks, "pulse", language, emitOpts));
       parts.push("");
     }
     if (wantsShimmer) {
-      parts.push(emitVariantComponent(componentName, blocks, "shimmer", language));
+      parts.push(emitVariantComponent(componentName, blocks, "shimmer", language, emitOpts));
       parts.push("");
     }
 
@@ -571,12 +691,18 @@ export async function handler(args: Args): Promise<ToolResult> {
 
     const text = `${code}\n\n${usageBlock}`;
 
+    const referenceExcerpts: ReferenceExcerpt[] = referenceTexts.map((r) => ({
+      name: r.name,
+      excerpt: r.markdown.slice(0, REFERENCE_EXCERPT_CHARS),
+    }));
+
     return toolOk(text, {
       skeletonCode: code,
       filename,
       cssRequired: KEYFRAMES_CSS,
       usageExample: `${usageImport}\n\n${usageJsx}`,
       routedReferences,
+      referenceExcerpts,
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

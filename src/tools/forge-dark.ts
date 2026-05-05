@@ -1,7 +1,10 @@
 import { z } from "zod";
 import { toolError, toolOk } from "../types/index.js";
-import type { ToolResult, Aggressiveness } from "../types/index.js";
+import type { ToolResult, Aggressiveness, ReferenceExcerpt } from "../types/index.js";
+import { REFERENCE_EXCERPT_CHARS } from "../types/index.js";
 import { DF_TOKENS_CSS, DF_TOKEN_NAMES } from "../lib/token-system.js";
+import { routeIntent } from "../lib/reference-router.js";
+import { loadReference } from "../lib/reference-loader.js";
 
 export const title = "Forge dark variant of a component";
 export const description =
@@ -14,6 +17,10 @@ export const inputSchema = {
     .optional()
     .default("full")
     .describe("subtle = obvious swaps only; full = all token replacements; extreme = full + glass/glow/transition enhancements."),
+  description: z
+    .string()
+    .optional()
+    .describe("Optional freeform description of the component's intent (e.g. 'glass chips with neon edge glow'). When provided, Darkforge consults bundled style/pattern references and applies their hints in addition to token swaps."),
 };
 
 interface RuleHit {
@@ -253,6 +260,133 @@ function applyInteractiveTransitions(code: string, hits: RuleHit[]): string {
   });
 }
 
+/* ---------- description-aware hints ---------- */
+
+interface Hints {
+  /** mentions glass / glassmorphism / blur card / frosted */
+  glass: boolean;
+  /** mentions glow / neon / edge glow / ambient glow */
+  glow: boolean;
+  /** mentions hover / interactive / clickable */
+  hover: boolean;
+  /** mentions stagger / sequence */
+  stagger: boolean;
+  /** mentions card / chip / tile (per-element treatment target) */
+  card: boolean;
+}
+
+/**
+ * Derive hint flags from the user-supplied description plus a sanity check
+ * that the relevant reference is actually loaded. The reference check makes
+ * the integration explicit — if the bundled reference text changes shape
+ * the flags fail closed instead of silently misfiring.
+ */
+function descriptionHints(
+  desc: string | undefined,
+  references: { name: string; markdown: string }[]
+): Hints {
+  const lower = (desc ?? "").toLowerCase();
+  const tokensRef = references.find((r) => r.name === "00-dark-tokens");
+  const tokensMd = tokensRef ? tokensRef.markdown : "";
+  // Sanity check: only treat hints as actionable when the tokens reference
+  // contains the markers we are about to emit class-strings for. The tokens
+  // ref always defines these, but the explicit check guards against drift.
+  const tokensHaveGlass = tokensMd.includes("--df-glass-bg");
+  const tokensHaveGlow = tokensMd.includes("--df-glow-");
+
+  const mentionsGlass = /\bglass\b|glassmorphism|frosted|blur card/.test(lower);
+  const mentionsGlow = /\bglow\b|\bneon\b|edge glow|ambient glow|glowing/.test(lower);
+  const mentionsHover = /\bhover\b|interactive|clickable|tappable/.test(lower);
+  const mentionsStagger = /\bstagger(ed)?\b|\bsequence\b|\bcascade\b/.test(lower);
+  const mentionsCard = /\bcard\b|\bchip\b|\btile\b|feature card/.test(lower);
+
+  return {
+    glass: mentionsGlass && tokensHaveGlass,
+    glow: mentionsGlow && tokensHaveGlow,
+    hover: mentionsHover,
+    stagger: mentionsStagger,
+    card: mentionsCard,
+  };
+}
+
+/**
+ * For each element with a `rounded-*` class that has been promoted to glass
+ * (carries `bg-[var(--df-glass-bg)]`) and does not yet carry a `shadow-[var(--df-glow-`
+ * token, attach a per-chip neon glow with a hover-stronger glow swap.
+ *
+ * Tokens used (`--df-glow-violet` and `--df-glow-cyan`) both exist in
+ * DF_TOKEN_NAMES so collectTokens picks them up. Idempotent: skips if the
+ * element already carries any df-glow shadow.
+ */
+function applyChipGlow(code: string, hits: RuleHit[]): string {
+  return code.replace(GLASS_RE, (full, _name: string | undefined, quote: string, classes: string) => {
+    if (!/\brounded-/.test(classes)) return full;
+    if (!/bg-\[var\(--df-glass-bg\)\]/.test(classes)) return full;
+    if (/shadow-\[var\(--df-glow-/.test(classes)) return full;
+
+    const before = classes;
+    const next = `${classes} shadow-[var(--df-glow-violet)] hover:shadow-[var(--df-glow-cyan)]`.trim();
+    hits.push({
+      from: before.trim(),
+      to: next,
+      reason: "Per-chip neon glow",
+    });
+    const attr = full.startsWith("className") ? "className" : "class";
+    return `${attr}=${quote}${next}${quote}`;
+  });
+}
+
+/**
+ * Where prior rules inserted `border-[var(--df-border-default)]`, upgrade to a
+ * color-mix border that bleeds 30% neon violet into the default border.
+ * Tailwind v4 arbitrary values use underscores in place of spaces inside
+ * brackets. Idempotent: if the upgraded form is already present we no-op.
+ */
+function applyColorMixBorder(code: string, hits: RuleHit[]): string {
+  const FROM = "border-[var(--df-border-default)]";
+  const TO = "border-[color-mix(in_oklab,var(--df-border-default)_70%,var(--df-neon-violet)_30%)]";
+  if (!code.includes(FROM)) return code; // nothing to upgrade
+  // Count remaining unupgraded occurrences and replace each. split/join is
+  // safe because FROM is a fixed literal string, not a regex.
+  const count = code.split(FROM).length - 1;
+  if (count === 0) return code;
+  const next = code.split(FROM).join(TO);
+  for (let i = 0; i < count; i++) {
+    hits.push({
+      from: FROM,
+      to: TO,
+      reason: "Color-mix neon border upgrade",
+    });
+  }
+  return next;
+}
+
+/**
+ * Inject a hint comment marking that the caller should wrap children in a
+ * motion list with staggerChildren. We can't synthesize motion imports here,
+ * so a TODO comment is the safe surface.
+ *
+ * Placement: prepended to the code string (before any `<tag>`). A leading
+ * `/* ... *\/` block sits cleanly at the top of a TSX/JSX module and avoids
+ * the parse hazard of dropping a non-JSX comment between sibling JSX nodes.
+ * Idempotent.
+ */
+function applyStaggerHint(code: string, hits: RuleHit[]): string {
+  const MARKER = "/* TODO: wrap in motion list with staggerChildren */";
+  if (code.includes(MARKER)) return code;
+  // If there's no JSX at all, skip — the comment would be misleading.
+  const m = code.match(/<[a-zA-Z]/);
+  if (!m || m.index === undefined) return code;
+  // Prepend before any leading whitespace so the comment is the first token.
+  const next = `${MARKER}\n${code}`;
+  hits.push({
+    from: "(no marker)",
+    to: MARKER,
+    reason: "Stagger hint comment",
+  });
+  return next;
+}
+
 /* ---------- token CSS slicing ---------- */
 
 function buildTokensCss(tokensAdded: Set<string>): string {
@@ -266,6 +400,7 @@ function buildTokensCss(tokensAdded: Set<string>): string {
 export async function handler(args: {
   componentCode: string;
   aggressiveness?: Aggressiveness;
+  description?: string;
 }): Promise<ToolResult> {
   try {
     const componentCode = args.componentCode;
@@ -286,6 +421,22 @@ export async function handler(args: {
       ]);
     }
 
+    // --- Resolve references when description is supplied. ---
+    const referenceTexts: { name: string; markdown: string }[] = [];
+    if (typeof args.description === "string" && args.description.trim().length > 0) {
+      const names = routeIntent(args.description);
+      for (const name of names) {
+        try {
+          referenceTexts.push({ name, markdown: await loadReference(name) });
+        } catch {
+          /* skip on miss — router can name refs that the bundle hasn't shipped yet */
+        }
+      }
+    }
+
+    const hints = descriptionHints(args.description, referenceTexts);
+    const hasDescription = referenceTexts.length > 0;
+
     const changes: RuleHit[] = [];
     const tokensAdded = new Set<string>();
     let darkCode = componentCode;
@@ -304,16 +455,54 @@ export async function handler(args: {
       });
     }
 
-    // --- Pass 2: extreme-only structural enhancements. Run AFTER Pass 1 so we
-    // operate on already-tokenized markup and check for token presence to stay
-    // idempotent against re-runs. ---
-    if (level === "extreme") {
-      darkCode = applyGlassUpgrade(darkCode, changes);
-      darkCode = applyRootGlow(darkCode, changes);
+    // --- Pass 2: structural enhancements. Behavior matrix:
+    //   level=subtle                      : token swaps only (Pass 1).
+    //   level=full,    no description     : token swaps only (v1.0 unchanged).
+    //   level=full,    with description   : swaps + transitions + (hints.glass) glass
+    //                                       + (hints.glow) per-chip glow.
+    //   level=extreme, no description     : swaps + transitions + glass + root glow
+    //                                       (v1.0 unchanged).
+    //   level=extreme, with description   : full-with-description + root glow
+    //                                       + (hints.glow) color-mix borders
+    //                                       + (hints.stagger) stagger TODO marker.
+    //
+    // Backward-compat rule: callers that never set `description` must keep getting
+    // identical v1.0 output. The transitions/glass/glow lift-out gates on either
+    // extreme level OR hasDescription, never on full-without-description alone.
+    //
+    // Run AFTER Pass 1 so we operate on already-tokenized markup and check for
+    // token presence to stay idempotent against re-runs.
+    // -------------------------------------------------------------------------
+    if (level === "extreme" || hasDescription) {
       darkCode = applyInteractiveTransitions(darkCode, changes);
+      if (hints.glass) {
+        darkCode = applyGlassUpgrade(darkCode, changes);
+      }
+      if (hints.glow) {
+        darkCode = applyChipGlow(darkCode, changes);
+      }
+    }
 
-      // Refresh token set against the post-extreme code so glass / glow tokens
-      // get included in `tokensCssToAdd`.
+    if (level === "extreme") {
+      // v1.0 fired glass + root glow unconditionally at extreme. We keep that
+      // for callers who never pass `description`; with a glass hint we already
+      // ran the upgrade above so we skip the duplicate call.
+      if (!hints.glass) {
+        darkCode = applyGlassUpgrade(darkCode, changes);
+      }
+      darkCode = applyRootGlow(darkCode, changes);
+      if (hints.glow) {
+        darkCode = applyColorMixBorder(darkCode, changes);
+      }
+      if (hints.stagger) {
+        darkCode = applyStaggerHint(darkCode, changes);
+      }
+    }
+
+    // Refresh token set against the post-enhancement code so glass / glow / neon
+    // tokens (e.g. --df-glass-bg, --df-glow-violet, --df-neon-violet) get
+    // included in `tokensCssToAdd`.
+    if (level === "extreme" || hasDescription) {
       collectTokens(darkCode, tokensAdded);
     }
 
@@ -322,6 +511,20 @@ export async function handler(args: {
     const sections: string[] = [];
     sections.push(`Darkforge forge_dark — aggressiveness: ${level}`);
     sections.push("");
+    if (hasDescription) {
+      sections.push("── References consulted ──");
+      for (const r of referenceTexts) {
+        sections.push(`- ${r.name}`);
+      }
+      sections.push("");
+      sections.push("── Reference excerpts ──");
+      for (const r of referenceTexts) {
+        const excerpt = r.markdown.slice(0, 200).replace(/\s+$/g, "");
+        sections.push(`▸ ${r.name}`);
+        sections.push(excerpt);
+        sections.push("");
+      }
+    }
     sections.push("── Converted code ──");
     sections.push(darkCode);
     sections.push("");
@@ -339,11 +542,19 @@ export async function handler(args: {
     sections.push("── Tokens to add to globals.css ──");
     sections.push(tokensCssToAdd || "(no Darkforge tokens were emitted — nothing to add)");
 
+    const routedReferences: string[] = referenceTexts.map((r) => r.name);
+    const referenceExcerpts: ReferenceExcerpt[] = referenceTexts.map((r) => ({
+      name: r.name,
+      excerpt: r.markdown.slice(0, REFERENCE_EXCERPT_CHARS),
+    }));
+
     return toolOk(sections.join("\n"), {
       darkCode,
       changes,
       tokensAdded: Array.from(tokensAdded).sort(),
       tokensCssToAdd,
+      routedReferences,
+      referenceExcerpts,
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

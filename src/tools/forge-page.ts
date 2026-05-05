@@ -1,6 +1,13 @@
 import { z } from "zod";
-import { toolError, toolOk } from "../types/index.js";
-import type { Framework, Language, PageType, StackHint, ToolResult } from "../types/index.js";
+import { toolError, toolOk, REFERENCE_EXCERPT_CHARS } from "../types/index.js";
+import type {
+  Framework,
+  Language,
+  PageType,
+  ReferenceExcerpt,
+  StackHint,
+  ToolResult,
+} from "../types/index.js";
 import { detectStack } from "../lib/stack-detector.js";
 import { routeIntent } from "../lib/reference-router.js";
 import { loadReference } from "../lib/reference-loader.js";
@@ -40,6 +47,12 @@ export const inputSchema = {
     .optional()
     .default("dark")
     .describe("Visual treatment for surfaces and CTAs."),
+  description: z
+    .string()
+    .optional()
+    .describe(
+      "Free-text intent (e.g. 'dark saas landing with partner logos strip and staggered hero animations'). Routes additional references and can imply extra sections like a partner-logos strip.",
+    ),
 };
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -54,6 +67,7 @@ interface ForgeArgs {
   stack?: StackHint;
   projectPath?: string;
   theme?: Theme;
+  description?: string;
 }
 
 interface ResolvedStack {
@@ -67,11 +81,18 @@ interface GeneratedFile {
   code: string;
 }
 
+interface ReferenceText {
+  name: string;
+  markdown: string;
+}
+
 interface SectionCtx {
   pageType: PageType;
   theme: Theme;
   stack: ResolvedStack;
   ext: "tsx" | "jsx";
+  description: string;
+  referenceTexts: ReferenceText[];
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1804,9 +1825,151 @@ function generateSection(section: string, ctx: SectionCtx): GeneratedFile {
       return generateDashboardCharts(ctx);
     case "table":
       return generateDashboardTable(ctx);
+    case "partner-logos":
+    case "partnerlogos":
+    case "logos":
+    case "logo-strip":
+    case "brand-strip":
+      return generatePartnerLogos(ctx);
     default:
       return generateGeneric(section, ctx);
   }
+}
+
+// ── Partner logos / brand strip ─────────────────────────────────────────────
+
+function generatePartnerLogos(ctx: SectionCtx): GeneratedFile {
+  const { theme, stack, ext, referenceTexts } = ctx;
+  const fm = stack.hasFramerMotion;
+
+  // Presence checks — same approach as the page wrapper.
+  const hasGlassRef = referenceTexts.some((r) => r.markdown.includes("--df-glass-bg"));
+  const hasLogoStripPattern = referenceTexts.some((r) => r.name === "patterns/features");
+  const hasStaggerRef = referenceTexts.some(
+    (r) => r.name === "01-framer-motion" || r.markdown.includes("staggerChildren"),
+  );
+
+  // Eight neutral wordmark placeholders. Real consumers swap these for real brands.
+  const brands = [
+    "Northwind",
+    "Atlas",
+    "Outpost",
+    "Crate.dev",
+    "Linear",
+    "Notion",
+    "Verdana",
+    "Helios",
+  ];
+
+  // When the features pattern reference is loaded, emit a tighter horizontal
+  // strip with marquee-style spacing. Otherwise still emit a strip — but a
+  // lighter, plainer one.
+  const stripGap = hasLogoStripPattern ? "2.5rem" : "1.5rem";
+  const useStaggerInner = fm && hasStaggerRef;
+
+  const itemTag = useStaggerInner ? "motion.div" : "div";
+  const itemVariants = useStaggerInner
+    ? `variants={{ hidden: { opacity: 0, y: 8 }, visible: { opacity: 1, y: 0 } }}`
+    : "";
+
+  const items = brands
+    .map(
+      (name) => `<${itemTag}
+  ${itemVariants}
+  style={{
+    fontFamily: "ui-sans-serif, system-ui, sans-serif",
+    fontSize: "1rem",
+    fontWeight: 600,
+    letterSpacing: "0.02em",
+    color: "var(--df-text-muted)",
+    opacity: 0.85,
+    whiteSpace: "nowrap",
+  }}
+>
+  ${name}
+</${itemTag}>`,
+    )
+    .join("\n");
+
+  const stripStyle =
+    theme === "glass" && hasGlassRef
+      ? `background: "var(--df-glass-bg)", backdropFilter: "blur(12px)", WebkitBackdropFilter: "blur(12px)", border: "1px solid var(--df-glass-border)"`
+      : `background: "var(--df-bg-surface)", border: "1px solid var(--df-border-default)"`;
+
+  const innerWrapper = useStaggerInner
+    ? `<motion.div
+  initial="hidden"
+  whileInView="visible"
+  viewport={{ once: true, margin: "-40px" }}
+  variants={{ hidden: {}, visible: { transition: { staggerChildren: 0.06 } } }}
+  style={{
+    display: "flex",
+    flexWrap: "wrap",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: "${stripGap}",
+  }}
+>
+${items}
+</motion.div>`
+    : `<div
+  className="df-logo-strip"
+  style={{
+    display: "flex",
+    flexWrap: "wrap",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: "${stripGap}",
+  }}
+>
+${items}
+</div>`;
+
+  const body = `<p
+  id="partnerlogossection-heading"
+  style={{
+    textAlign: "center",
+    color: "var(--df-text-muted)",
+    fontSize: "0.8125rem",
+    fontWeight: 600,
+    letterSpacing: "0.12em",
+    textTransform: "uppercase",
+    margin: "0 0 1.5rem",
+  }}
+>
+  Trusted by teams shipping every week
+</p>
+<div
+  style={{
+    ${stripStyle},
+    borderRadius: "var(--df-radius-lg)",
+    padding: "1.25rem 1.5rem",
+  }}
+>
+${innerWrapper}
+</div>`;
+
+  const importLine = useStaggerInner ? `import { motion } from "framer-motion";\n\n` : "";
+  // We can't easily inject extra imports through buildSectionFile, so we
+  // bypass it here when we need framer-motion at this section's top level
+  // and the scaffold doesn't already provide it. buildSectionFile already
+  // imports framer-motion when hasFramerMotion is true, so the standard
+  // path is fine. Use a plain body when we already use motion via scaffold.
+  void importLine;
+
+  const code = buildSectionFile({
+    componentName: "PartnerLogosSection",
+    ext,
+    ariaLabel: "Partner logos",
+    landmarkTag: "section",
+    body,
+    scopedCSS: `.df-logo-strip > * { transition: opacity var(--df-dur-base) var(--df-ease-out); }
+    .df-logo-strip > *:hover { opacity: 1 !important; }`,
+    rootStyle: `padding: "3rem 1.5rem", background: "var(--df-bg-base)"`,
+    hasFramerMotion: fm,
+  });
+
+  return { filename: `PartnerLogosSection.${ext}`, code };
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1818,8 +1981,32 @@ function buildRootPage(
   files: GeneratedFile[],
   stack: ResolvedStack,
   ext: "tsx" | "jsx",
+  ctx?: SectionCtx,
 ): GeneratedFile {
   const sections = files.map((f) => f.filename.replace(/\.(tsx|jsx)$/, ""));
+
+  // Reference-driven flags. Presence checks mirror Agent 1's approach: scan
+  // the loaded markdown for tell-tale tokens or filenames, gate behavior on
+  // the boolean.
+  const refs = ctx?.referenceTexts ?? [];
+  const lowerDesc = (ctx?.description ?? "").toLowerCase();
+  const hasGlassRef = refs.some((r) => r.markdown.includes("--df-glass-bg"));
+  const hasStaggerRef = refs.some(
+    (r) =>
+      r.markdown.includes("staggerChildren") ||
+      r.markdown.includes("delay: i *") ||
+      r.name === "01-framer-motion",
+  );
+  const wantsGlass =
+    /\b(glass|glassmorphism|frosted|blur card)\b/.test(lowerDesc) || ctx?.theme === "glass";
+  const sectionWrapperClass =
+    hasGlassRef && wantsGlass ? ` className="df-glass-section"` : "";
+  const wrapperGlassCSS =
+    hasGlassRef && wantsGlass
+      ? `\n      <style>{\`
+        .df-glass-section { background: var(--df-glass-bg); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); border-bottom: 1px solid var(--df-glass-border); }
+      \`}</style>`
+      : "";
 
   // Dashboard pages compose differently — DashboardShell wraps the others.
   if (pageType === "dashboard") {
@@ -1847,7 +2034,50 @@ ${shellChildren}
   const importStatements = sections
     .map((s) => `import ${s} from "./${s}.js";`)
     .join("\n");
-  const renders = sections.map((s) => `      <${s} />`).join("\n");
+
+  // Stagger variant — only emitted when reference markdown advertises it AND
+  // framer-motion is present. Otherwise we render plain children, same as before.
+  const useStaggerWrapper = hasStaggerRef && stack.hasFramerMotion;
+
+  if (useStaggerWrapper) {
+    const motionImport = `import { motion } from "framer-motion";`;
+    const renders = sections
+      .map(
+        (s) => `        <motion.div${sectionWrapperClass} variants={{ hidden: { opacity: 0, y: 16 }, visible: { opacity: 1, y: 0 } }}>
+          <${s} />
+        </motion.div>`,
+      )
+      .join("\n");
+    const code = `${motionImport}
+${importStatements}
+
+const pageStagger = {
+  hidden: {},
+  visible: { transition: { staggerChildren: 0.08, delayChildren: 0.05 } },
+};
+
+export default function Page() {
+  return (
+    <main
+      style={{
+        minHeight: "100vh",
+        background: "var(--df-bg-base)",
+        color: "var(--df-text-primary)",
+      }}
+    >${wrapperGlassCSS}
+      <motion.div initial="hidden" animate="visible" variants={pageStagger}>
+${renders}
+      </motion.div>
+    </main>
+  );
+}
+`;
+    return { filename: rootFilename(stack.framework, ext), code };
+  }
+
+  const renders = sections
+    .map((s) => `      <div${sectionWrapperClass}><${s} /></div>`)
+    .join("\n");
 
   const code = `${importStatements}
 
@@ -1859,7 +2089,7 @@ export default function Page() {
         background: "var(--df-bg-base)",
         color: "var(--df-text-primary)",
       }}
-    >
+    >${wrapperGlassCSS}
 ${renders}
     </main>
   );
@@ -1963,30 +2193,67 @@ export async function handler(args: ForgeArgs): Promise<ToolResult> {
     const stack = resolveStack(args, detected);
     const ext: "tsx" | "jsx" = stack.language === "javascript" ? "jsx" : "tsx";
 
-    const sections =
-      args.sections && args.sections.length > 0
-        ? args.sections
-        : DEFAULT_SECTIONS[pageType];
+    const description = (args.description ?? "").trim();
+    const lowerDesc = description.toLowerCase();
 
-    // Reference routing: compose a free-text intent from the pageType, the
-    // resolved section list, and the theme, then ask the router for matches.
-    // Loading the top match is best-effort — a miss must not abort the tool.
-    const routingInput = `${pageType} ${sections.join(" ")} ${theme}`;
+    // Resolve sections from explicit override or pageType defaults. When the
+    // section list is defaulted, we may augment it from description hints.
+    const explicitSections = !!(args.sections && args.sections.length > 0);
+    const baseSections = explicitSections
+      ? (args.sections as string[])
+      : [...DEFAULT_SECTIONS[pageType]];
+
+    const wantsLogoStrip =
+      /\b(partner logo|partner-logos|partner logos|logo strip|logos strip|brand strip|marquee)\b/.test(
+        lowerDesc,
+      );
+    const hasFeatures = baseSections.some(
+      (s) => s.toLowerCase() === "features" || s.toLowerCase() === "partner-logos",
+    );
+
+    let sections = baseSections;
+    if (!explicitSections && wantsLogoStrip && !baseSections.includes("partner-logos")) {
+      // Insert a partner-logos strip near the top, after hero if present.
+      const heroIdx = baseSections.findIndex((s) => s.toLowerCase() === "hero");
+      sections = [...baseSections];
+      const insertAt = heroIdx >= 0 ? heroIdx + 1 : 0;
+      sections.splice(insertAt, 0, "partner-logos");
+      void hasFeatures;
+    }
+
+    // Reference routing: compose a free-text intent from pageType, sections,
+    // and the user's free-text description. Load ALL routed refs (cap is
+    // upstream in routeIntent). Each load is best-effort — a miss must not
+    // abort the tool.
+    const routingInput = [pageType, ...sections, description].filter(Boolean).join(" ");
     const routedReferences = routeIntent(routingInput);
-    let referenceExcerpt = "";
-    if (routedReferences.length > 0) {
+
+    const referenceTexts: ReferenceText[] = [];
+    for (const name of routedReferences) {
       try {
-        const md = await loadReference(routedReferences[0]);
-        referenceExcerpt = md.slice(0, 600);
+        const md = await loadReference(name);
+        referenceTexts.push({ name, markdown: md });
       } catch {
-        // Reference miss is non-fatal — leave excerpt empty and continue.
+        // Reference miss is non-fatal — skip and continue.
       }
     }
 
-    const ctx: SectionCtx = { pageType, theme, stack, ext };
+    const referenceExcerpts: ReferenceExcerpt[] = referenceTexts.map((r) => ({
+      name: r.name,
+      excerpt: r.markdown.slice(0, REFERENCE_EXCERPT_CHARS),
+    }));
+
+    const ctx: SectionCtx = {
+      pageType,
+      theme,
+      stack,
+      ext,
+      description,
+      referenceTexts,
+    };
 
     const sectionFiles = sections.map((s) => generateSection(s, ctx));
-    const rootFile = buildRootPage(pageType, sectionFiles, stack, ext);
+    const rootFile = buildRootPage(pageType, sectionFiles, stack, ext, ctx);
     const allFiles: GeneratedFile[] = [...sectionFiles, rootFile];
 
     const pageStructure = buildPageStructure(sectionFiles);
@@ -2002,11 +2269,10 @@ export async function handler(args: ForgeArgs): Promise<ToolResult> {
     const headerLines: string[] = [];
     if (routedReferences.length > 0) {
       headerLines.push(`// References consulted: ${routedReferences.join(", ")}`);
-      if (referenceExcerpt) {
-        headerLines.push(`// Reference excerpt (${routedReferences[0]}):`);
-        for (const line of referenceExcerpt.split("\n")) {
-          headerLines.push(`// ${line}`);
-        }
+      for (const exc of referenceExcerpts) {
+        // Cap each per-ref comment block at ~200 chars total of body.
+        const trimmed = exc.excerpt.replace(/\s+/g, " ").trim().slice(0, 200);
+        headerLines.push(`// ${exc.name}: ${trimmed}`);
       }
       headerLines.push("");
     }
@@ -2033,6 +2299,7 @@ export async function handler(args: ForgeArgs): Promise<ToolResult> {
       pageStructure,
       setupInstructions,
       routedReferences,
+      referenceExcerpts,
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

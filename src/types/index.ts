@@ -19,6 +19,20 @@ export type PageType = "saas" | "product" | "portfolio" | "agency" | "startup" |
  */
 export type ReferenceName = string;
 
+/**
+ * A single reference excerpt as surfaced in tool responses. The excerpt is
+ * truncated (~800 chars) so the full payload across 4 references stays in a
+ * sane size budget. Tools that consult the router include an array of these
+ * in `structuredContent.referenceExcerpts`.
+ */
+export interface ReferenceExcerpt {
+  name: ReferenceName;
+  excerpt: string;
+}
+
+/** Public excerpt length (chars). Internal full markdown is uncapped. */
+export const REFERENCE_EXCERPT_CHARS = 800;
+
 export interface LibraryCapability {
   name: string;
   category: Category;

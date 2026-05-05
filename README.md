@@ -6,14 +6,32 @@ Companion MCP server for the [Darkforge Claude Code plugin](https://github.com/K
 
 ---
 
-## v1.1 — combined mode
+## v1.1 — bundled references
 
-The MCP server now bundles the same 35+ reference documents the Darkforge Claude Code plugin uses (~44k lines of library knowledge spanning Framer Motion, GSAP, R3F, Aceternity, Magic UI, shadcn, Mantine, Lenis, dashboard patterns, hero patterns, and more).
+The MCP server bundles the same 45 reference documents the Darkforge Claude Code plugin uses (~44,000 lines covering Framer Motion, GSAP, Three.js / R3F, Aceternity, Magic UI, shadcn, Mantine, Lenis, dashboard patterns, hero patterns, the AMOLED token system, and more).
 
-- **Standalone** — works in any MCP client without the plugin. Schemas, tool names, and outputs are unchanged from v1.0.
-- **Combined with the plugin** — in Claude Code, plugin static knowledge plus live MCP tools means generation can route the same intent through either path. The MCP tools internally consult the routing table; one new tool, `get_reference`, exposes the markdown directly to any host AI.
+### How routing works
 
-`forge_component`, `forge_page`, and `forge_skeleton` now route descriptions through the bundled reference table before generation. When a description matches a known library or pattern (e.g. "aceternity tracing beam hero" routes to `04-aceternity` + `patterns/hero`), the matched reference's markdown informs import choices and shows up as a `// Reference excerpt:` block in the tool output. The structured payload includes `routedReferences` so host AIs can see what informed the result.
+Every `forge_*` call goes through `routeIntent(description)` before generation. The router:
+
+1. Always loads `00-dark-tokens` (the design-system foundation — token system, glass utility classes, neon glow utilities). No library knows you want dark UI by default; this anchor reference makes the variant decisions sane.
+2. Walks a manual synonym table (style/intent vocabulary like `glass`, `neon`, `stagger`, `partner`, `marquee`, `chip`).
+3. Walks the auto-generated table mirrored from the plugin's `SKILL.md` (literal library names like `aceternity`, `framer-motion`, `gsap`).
+4. Returns up to 4 references ranked tokens → lib → pattern.
+
+### How tools consume references
+
+`forge_component`, `forge_skeleton`, and `forge_page` thread the loaded markdown into their template builders. Concrete consumption:
+
+- Variant selection respects style cues — `glass chips, neon edge glow` triggers `--df-glass-bg` + `--df-glow-violet` emission per element, not just at the root.
+- List builders extract named entities from the description (`for Microsoft, AWS, Google Cloud` → renders three placeholders/items, named verbatim — no stock placeholder content).
+- Layout follows description over `componentType` — `feature-grid` plus `strip` produces a horizontal flex layout.
+- Motion stagger is emitted when `01-framer-motion.md` is loaded AND the description mentions stagger / sequence / cascade words.
+- Imports and `prefersReduced` are derived from the assembled body, never declared and unused.
+
+`forge_dark` accepts an optional `description` field. When provided, it consults the same router and applies per-element treatments (glass utilities, color-mixed borders, named glow tokens) instead of just root-level enhancements.
+
+Every routed tool returns `structuredContent.routedReferences` (names) and `structuredContent.referenceExcerpts` (800-char slices of each loaded markdown), so host AIs see what informed the result without a second round trip.
 
 ---
 
