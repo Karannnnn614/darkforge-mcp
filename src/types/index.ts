@@ -33,6 +33,108 @@ export interface ReferenceExcerpt {
 /** Public excerpt length (chars). Internal full markdown is uncapped. */
 export const REFERENCE_EXCERPT_CHARS = 800;
 
+/* ── pipeline types (description -> scaffold -> variant -> motion) ───────── */
+
+/**
+ * Layout/semantic primitive detected in a description. Order in a ParsedSpec
+ * reflects first-occurrence in the source text. New entries here MUST also
+ * add detection rules in description-parser.ts.
+ */
+export type Structure =
+  | "sidebar"
+  | "nav"
+  | "grid"
+  | "list"
+  | "hero"
+  | "modal"
+  | "drawer"
+  | "strip"
+  | "card"
+  | "tile"
+  | "table"
+  | "form"
+  | "footer"
+  | "header"
+  | "breadcrumb"
+  | "tabs"
+  | "accordion"
+  | "stat"
+  | "pricing-tier"
+  | "testimonial"
+  | "feature";
+
+/** Visual style cues. Drives variant resolution and per-element decoration. */
+export type StyleCue =
+  | "neon"
+  | "glass"
+  | "minimal"
+  | "dark"
+  | "amoled"
+  | "glow"
+  | "blur"
+  | "gradient"
+  | "mesh";
+
+/** Motion intent cues. Drives whether and how motion-applier wraps the scaffold. */
+export type MotionCue =
+  | "reveal"
+  | "fade"
+  | "stagger"
+  | "hover-lift"
+  | "on-mount"
+  | "scroll-trigger"
+  | "parallax"
+  | "magnetic";
+
+/**
+ * Parsed structural representation of a freeform description. Pure data.
+ * Produced by `parseDescription`, consumed by every later pipeline stage.
+ */
+export interface ParsedSpec {
+  /** Detected structures in first-occurrence order, deduped. */
+  structures: Structure[];
+  /** Map structure -> declared count (e.g. "4 stat cards" -> {stat: 4}). */
+  counts: Record<string, number>;
+  /** Named entities preserved verbatim from the description. */
+  entities: string[];
+  /** Style intent cues. */
+  styleCues: Set<StyleCue>;
+  /** Motion intent cues. */
+  motionCues: Set<MotionCue>;
+  /** Short, clean noun-phrase headline derived from the description. */
+  headline: string;
+  /** The original description, unmodified. */
+  raw: string;
+}
+
+/**
+ * A semantic JSX scaffold built from a ParsedSpec. The variant- and
+ * motion-applier layers mutate `jsx` and `imports` in place; the renderer
+ * assembles the final componentCode string.
+ */
+export interface Scaffold {
+  /** PascalCase component name derived from the headline. */
+  componentName: string;
+  /** JSX body (the `return (...)` content, no surrounding function). */
+  jsx: string;
+  /** Imports needed by the body. Sorted/deduped at render time. */
+  imports: ScaffoldImport[];
+  /** Tokens used in the body. Recomputed by regex scan after each pipeline stage. */
+  tokensUsed: Set<string>;
+  /** Whether `prefersReduced` is referenced in jsx (motion path enabled). */
+  usesPrefersReduced: boolean;
+}
+
+/** A single ESM import line specified structurally so the renderer can dedupe. */
+export interface ScaffoldImport {
+  /** e.g. "react", "framer-motion" */
+  from: string;
+  /** Default-imported binding (e.g. "* as React" -> { default: "* as React" }). */
+  default?: string;
+  /** Named imports. */
+  named?: string[];
+}
+
 export interface LibraryCapability {
   name: string;
   category: Category;

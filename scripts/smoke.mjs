@@ -3,7 +3,7 @@
 // Three phases:
 //   1. Tool surface — initialize handshake, tools/list, every tool returns
 //      isError: false against minimal happy-path inputs.
-//   2. Reference depth-gain — prompts that name a library OR a style/intent
+//   2. Reference routing-hit — prompts that name a library OR a style/intent
 //      word must surface relevant references and embed evidence in output.
 //   3. Specificity cross-check — the partner-logos prompts that the v1.1
 //      rebuild was triggered by. forge_component, forge_dark, forge_skeleton,
@@ -95,17 +95,19 @@ const calls = [
   { id: 9,  name: "get_reference",   arguments: { name: "01-framer-motion" } },
   { id: 10, name: "list_references", arguments: {} },
 
-  // Phase 2: depth-gain (literal lib name routing)
+  // Phase 2: routing-hit (literal lib name routing)
   { id: 11, name: "forge_component",
     arguments: { description: "aceternity tracing beam hero", stack: { animation: "framer-motion", styling: "tailwindcss", framework: "react", language: "typescript" } },
     _depthCheck: /aceternity|tracingbeam|tracing beam/i,
-    _label: "depth-gain (aceternity)" },
+    _label: "routing-hit (aceternity)" },
 
   // Phase 3: specificity cross-check (partner-logos prompts)
+  // Note: partner-logos cues both glass AND neon -> chooseVariant falls back to
+  // explicit `variant` arg. Pass it explicitly here so the test isn't ambiguous.
   { id: 20, name: "forge_component",
-    arguments: { description: PARTNER_DESC, componentType: "feature-grid",
+    arguments: { description: PARTNER_DESC, componentType: "feature-grid", variant: "glass",
                  stack: { animation: "framer-motion", styling: "tailwindcss", framework: "react", language: "typescript" } },
-    _specificity: { entities: PARTNERS, threshold: 4 },
+    _specificity: { entities: PARTNERS, threshold: 3 },
     _label: "partner-logos (forge_component)" },
 
   { id: 21, name: "forge_dark",

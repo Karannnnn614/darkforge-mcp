@@ -6,32 +6,40 @@ Companion MCP server for the [Darkforge Claude Code plugin](https://github.com/K
 
 ---
 
-## v1.1 — bundled references
+## v1.1 — pipeline, scaffold, references
 
-The MCP server bundles the same 45 reference documents the Darkforge Claude Code plugin uses (~44,000 lines covering Framer Motion, GSAP, Three.js / R3F, Aceternity, Magic UI, shadcn, Mantine, Lenis, dashboard patterns, hero patterns, the AMOLED token system, and more).
+`forge_component`, `forge_skeleton`, and `forge_page` run a typed pipeline: parse the description into a structural spec, build a semantic scaffold from it, apply variant primitives, apply motion, attach reference hints. The MCP server emits a correct semantic skeleton with explicit `/* ELABORATE: ... */` markers; the host AI fills the markers with copy and micro-decisions, using the bundled references as context.
 
-### How routing works
+### Pipeline
 
-Every `forge_*` call goes through `routeIntent(description)` before generation. The router:
+1. **`parseDescription`** detects structures (sidebar, nav, grid, hero, modal, strip, ...), counts (`"4 stat cards"` -> `{stat: 4}`), entities (`"for Microsoft, AWS, Google Cloud"` -> three names), style cues (`neon`, `glass`, `glow`, ...), motion cues (`stagger`, `hover-lift`, `on-mount`, ...), and a clean headline.
+2. **`buildScaffold`** composes semantic JSX. Sidebar + stat layouts emit `<aside>` + `<main>` with N stat cards. Pricing tiers emit N tier cards with the middle one accented. Strips become horizontal `<ul>` of named entities. Where actual copy lives, the scaffold emits `/* ELABORATE: ... */` instead of placeholder text.
+3. **`applyVariant`** mutates inline `style={{ ... }}` props on data-anchored elements to apply real visual primitives — `color-mix` borders + stacked glow shadows for neon, `backdrop-filter` + `--df-glass-bg` for glass, subtle borders for minimal.
+4. **`applyMotion`** wraps the outermost element in `motion.*`, injects `useReducedMotion`, emits stagger child variants. `prefersReduced` is always referenced in the body — never declared and unused.
+5. **`attachReferenceHints`** writes a per-reference elaboration block telling the host AI what to pull from each routed reference.
 
-1. Always loads `00-dark-tokens` (the design-system foundation — token system, glass utility classes, neon glow utilities). No library knows you want dark UI by default; this anchor reference makes the variant decisions sane.
-2. Walks a manual synonym table (style/intent vocabulary like `glass`, `neon`, `stagger`, `partner`, `marquee`, `chip`).
-3. Walks the auto-generated table mirrored from the plugin's `SKILL.md` (literal library names like `aceternity`, `framer-motion`, `gsap`).
-4. Returns up to 4 references ranked tokens → lib → pattern.
+### Routing
 
-### How tools consume references
+Every `forge_*` call goes through `routeIntent(description)`:
 
-`forge_component`, `forge_skeleton`, and `forge_page` thread the loaded markdown into their template builders. Concrete consumption:
+1. Always returns `00-dark-tokens` first (the AMOLED token system + glass utilities + glow primitives).
+2. Walks a manual synonym table for style/intent words (`glass`, `neon`, `stagger`, `partner`, `marquee`, `chip`, ...).
+3. Walks the auto-generated table mirrored from the plugin's `SKILL.md` (literal library names — `aceternity`, `framer-motion`, `gsap`, ...).
+4. Returns up to 4 references ranked tokens -> lib -> pattern.
 
-- Variant selection respects style cues — `glass chips, neon edge glow` triggers `--df-glass-bg` + `--df-glow-violet` emission per element, not just at the root.
-- List builders extract named entities from the description (`for Microsoft, AWS, Google Cloud` → renders three placeholders/items, named verbatim — no stock placeholder content).
-- Layout follows description over `componentType` — `feature-grid` plus `strip` produces a horizontal flex layout.
-- Motion stagger is emitted when `01-framer-motion.md` is loaded AND the description mentions stagger / sequence / cascade words.
-- Imports and `prefersReduced` are derived from the assembled body, never declared and unused.
+### What's in the response
 
-`forge_dark` accepts an optional `description` field. When provided, it consults the same router and applies per-element treatments (glass utilities, color-mixed borders, named glow tokens) instead of just root-level enhancements.
+Every routed tool returns:
 
-Every routed tool returns `structuredContent.routedReferences` (names) and `structuredContent.referenceExcerpts` (800-char slices of each loaded markdown), so host AIs see what informed the result without a second round trip.
+- The component code with embedded `/* ELABORATE: ... */` markers.
+- An `-- BEGIN ELABORATION HINTS --` block that names each routed reference and a one-line guide on what to pull from it.
+- `structuredContent.parsedSpec` — the parsed structural representation, for transparency.
+- `structuredContent.appliedVariant` — the variant actually rendered (description cues can override the explicit arg).
+- `structuredContent.motionApplied` — whether the motion path triggered.
+- `structuredContent.routedReferences` — the reference names.
+- `structuredContent.referenceExcerpts` — 800-char slices of each loaded reference's markdown.
+
+`forge_dark` is a separate conversion tool — it takes light-themed code and rewrites it to AMOLED. It accepts an optional `description` field that gates additional per-element treatments (glass surfaces, per-chip glow, color-mix borders).
 
 ---
 

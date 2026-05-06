@@ -5,6 +5,8 @@ import { REFERENCE_EXCERPT_CHARS } from "../types/index.js";
 import { DF_TOKENS_CSS, DF_TOKEN_NAMES } from "../lib/token-system.js";
 import { routeIntent } from "../lib/reference-router.js";
 import { loadReference } from "../lib/reference-loader.js";
+import { parseDescription } from "../lib/description-parser.js";
+import { attachReferenceHints } from "../lib/reference-attacher.js";
 
 export const title = "Forge dark variant of a component";
 export const description =
@@ -276,40 +278,6 @@ interface Hints {
 }
 
 /**
- * Derive hint flags from the user-supplied description plus a sanity check
- * that the relevant reference is actually loaded. The reference check makes
- * the integration explicit — if the bundled reference text changes shape
- * the flags fail closed instead of silently misfiring.
- */
-function descriptionHints(
-  desc: string | undefined,
-  references: { name: string; markdown: string }[]
-): Hints {
-  const lower = (desc ?? "").toLowerCase();
-  const tokensRef = references.find((r) => r.name === "00-dark-tokens");
-  const tokensMd = tokensRef ? tokensRef.markdown : "";
-  // Sanity check: only treat hints as actionable when the tokens reference
-  // contains the markers we are about to emit class-strings for. The tokens
-  // ref always defines these, but the explicit check guards against drift.
-  const tokensHaveGlass = tokensMd.includes("--df-glass-bg");
-  const tokensHaveGlow = tokensMd.includes("--df-glow-");
-
-  const mentionsGlass = /\bglass\b|glassmorphism|frosted|blur card/.test(lower);
-  const mentionsGlow = /\bglow\b|\bneon\b|edge glow|ambient glow|glowing/.test(lower);
-  const mentionsHover = /\bhover\b|interactive|clickable|tappable/.test(lower);
-  const mentionsStagger = /\bstagger(ed)?\b|\bsequence\b|\bcascade\b/.test(lower);
-  const mentionsCard = /\bcard\b|\bchip\b|\btile\b|feature card/.test(lower);
-
-  return {
-    glass: mentionsGlass && tokensHaveGlass,
-    glow: mentionsGlow && tokensHaveGlow,
-    hover: mentionsHover,
-    stagger: mentionsStagger,
-    card: mentionsCard,
-  };
-}
-
-/**
  * For each element with a `rounded-*` class that has been promoted to glass
  * (carries `bg-[var(--df-glass-bg)]`) and does not yet carry a `shadow-[var(--df-glow-`
  * token, attach a per-chip neon glow with a hover-stronger glow swap.
@@ -421,6 +389,19 @@ export async function handler(args: {
       ]);
     }
 
+    // --- Parse description into structured spec (canonical source for hints). ---
+    const spec = parseDescription(args.description ?? "");
+    const hints: Hints = {
+      glass: spec.styleCues.has("glass") || spec.styleCues.has("blur"),
+      glow: spec.styleCues.has("glow") || spec.styleCues.has("neon"),
+      hover: spec.motionCues.has("hover-lift") || spec.motionCues.has("magnetic"),
+      stagger: spec.motionCues.has("stagger"),
+      card:
+        spec.structures.includes("card") ||
+        spec.structures.includes("tile") ||
+        spec.structures.includes("chip" as never),
+    };
+
     // --- Resolve references when description is supplied. ---
     const referenceTexts: { name: string; markdown: string }[] = [];
     if (typeof args.description === "string" && args.description.trim().length > 0) {
@@ -434,7 +415,6 @@ export async function handler(args: {
       }
     }
 
-    const hints = descriptionHints(args.description, referenceTexts);
     const hasDescription = referenceTexts.length > 0;
 
     const changes: RuleHit[] = [];
@@ -511,20 +491,6 @@ export async function handler(args: {
     const sections: string[] = [];
     sections.push(`Darkforge forge_dark — aggressiveness: ${level}`);
     sections.push("");
-    if (hasDescription) {
-      sections.push("── References consulted ──");
-      for (const r of referenceTexts) {
-        sections.push(`- ${r.name}`);
-      }
-      sections.push("");
-      sections.push("── Reference excerpts ──");
-      for (const r of referenceTexts) {
-        const excerpt = r.markdown.slice(0, 200).replace(/\s+$/g, "");
-        sections.push(`▸ ${r.name}`);
-        sections.push(excerpt);
-        sections.push("");
-      }
-    }
     sections.push("── Converted code ──");
     sections.push(darkCode);
     sections.push("");
@@ -548,6 +514,28 @@ export async function handler(args: {
       excerpt: r.markdown.slice(0, REFERENCE_EXCERPT_CHARS),
     }));
 
+    // Append elaboration hints AFTER the existing converted-code/changes/tokens
+    // sections so consumers see the canonical reference guidance last.
+    if (hasDescription) {
+      const { elaborationBlock } = attachReferenceHints(
+        "",
+        routedReferences,
+        referenceExcerpts,
+      );
+      sections.push("");
+      sections.push(elaborationBlock);
+    }
+
+    const parsedSpec = {
+      structures: spec.structures,
+      counts: spec.counts,
+      entities: spec.entities,
+      styleCues: Array.from(spec.styleCues),
+      motionCues: Array.from(spec.motionCues),
+      headline: spec.headline,
+      raw: spec.raw,
+    };
+
     return toolOk(sections.join("\n"), {
       darkCode,
       changes,
@@ -555,6 +543,7 @@ export async function handler(args: {
       tokensCssToAdd,
       routedReferences,
       referenceExcerpts,
+      parsedSpec,
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
